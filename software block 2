@@ -1,0 +1,193 @@
+**Project: High‑Performance Red–Cyan 3D Desktop Overlay**
+
+A lightweight native overlay that captures the Windows desktop via the Desktop Duplication API (DXGI) or Vulkan, applies an anaglyph shader, and renders it through a minimal Electron/WebGPU UI. Performance‑critical parts use a C++ native addon; UI and controls remain in HTML/CSS for ease of use.
+
+---
+
+### 1. Architecture Overview
+
+1. **Capture Layer**  
+   - Native C++ addon using **Desktop Duplication API (DXGI)** on Windows 10/11 for zero-copy, GPU-accelerated frame grabs.  
+   - *(Alternative)* Vulkan’s `vkGetMemoryFdKHR` shared memory path if GPU/Vulkan runtime is available.  
+   - **AMD Optimization:** When an AMD GPU is detected (vendorId == 0x1002), prefer Vulkan path and enable `VK_AMD_gpu_shader_half_float` extension for reduced bandwidth.
+2. **Processing Layer**  
+   - **WebGPU** (via Electron experimental flag) to leverage DirectX 12 or Vulkan backends.  
+   - Anaglyph shader compiled at startup, with uniforms for `depthOffset` and color correction.  
+   - **AMD Optimization:** Use AMD’s Asynchronous Compute and Wave32 hints on RDNA GPUs for higher throughput.
+3. **Rendering & UI Layer**  
+   - **Electron BrowserWindow** in frameless, always-on-top, transparent mode.  
+   - HTML controls (slider, toggle button) overlaid on top with `pointer-events: none`, controlled via hotkeys.
+
+---
+
+### 2. package.json (Key Extras)
+```json
+{
+  "name": "rc-3d-desktop",
+  "version": "0.2.0",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron --enable-features=WebGPU ."
+  },
+  "dependencies": {
+    "electron": "^25.0.0"
+  },
+  "devDependencies": {
+    "node-gyp": "^9.4.0"
+  }
+}
+```
+
+---
+
+### 3. main.js (Electron Main Process)
+```js
+const { app, BrowserWindow, globalShortcut } = require('electron');
+const path = require('path');
+let win;
+
+function createWindow() {
+  win = new BrowserWindow({
+    width: 800, height: 600,
+    frame: false, transparent: true,
+    alwaysOnTop: true, fullscreen: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      experimentalFeatures: true  // enable WebGPU
+    }
+  });
+  win.loadFile('index.html');
+}
+
+app.whenReady().then(() => {
+  createWindow();
+  // Toggle overlay
+  globalShortcut.register('Control+Shift+3', () => win.webContents.send('toggle-overlay'));
+});
+app.on('window-all-closed', () => app.quit());
+```
+
+---
+
+### 4. preload.js (Secure IPC)
+```js
+const { contextBridge, ipcRenderer } = require('electron');
+const capture = require('./build/Release/desktop_captor');  // native addon
+
+contextBridge.exposeInMainWorld('api', {
+  startCapture: () => capture.start(),
+  onFrame: (cb) => capture.onFrame(cb),
+  onToggle: (cb) => ipcRenderer.on('toggle-overlay', cb)
+});
+```
+
+---
+
+### 5. index.html & renderer.js (WebGPU + UI)
+
+```html
+<!DOCTYPE html><body style="margin:0; overflow:hidden">
+  <canvas id="canvas"></canvas>
+  <div id="controls" style="position:absolute; top:10px; left:10px; z-index:10;">
+    <input id="depth" type="range" min="0" max="1" step="0.005" value="0.02">
+    <button id="toggle">Toggle 3D</button>
+  </div>
+  <script src="renderer.js"></script>
+</body>
+```
+
+```js
+(async () => {
+  const canvas = document.getElementById('canvas');
+  const depthSlider = document.getElementById('depth');
+  const toggleBtn = document.getElementById('toggle');
+
+  // Initialize WebGPU
+  const adapter = await navigator.gpu.requestAdapter();
+  const device = await adapter.requestDevice();
+  const context = canvas.getContext('webgpu');
+
+  // Configure canvas
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  context.configure({ device, format });
+
+  // Load shader module
+  const shaderModule = device.createShaderModule({ code: `
+    @group(0) @binding(0) var myTexture: texture_2d<f32>;
+    @group(0) @binding(1) var mySampler: sampler;
+
+    @group(1) @binding(0) var<uniform> params: Uniforms;
+
+    struct Uniforms { depthOffset: f32 };
+
+    @vertex fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
+      var pos = array<vec2<f32>, 6>(
+        vec2(-1, -1), vec2(1, -1), vec2(-1, 1),
+        vec2(-1, 1), vec2(1, -1), vec2(1, 1)
+      );
+      return vec4(pos[idx], 0.0, 1.0);
+    }
+
+    @fragment fn fs_main(@builtin(position) FragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+      let uv = FragCoord.xy / vec2<f32>(canvasWidth, canvasHeight);
+      let lo = textureSample(myTexture, mySampler, uv + vec2<f32>(-params.depthOffset, 0));
+      let ro = textureSample(myTexture, mySampler, uv + vec2<f32>(params.depthOffset, 0));
+      return vec4<f32>(lo.r, ro.g, ro.b, 1.0);
+    }
+  `});
+
+  // Pipeline setup omitted… bind groups for texture, sampler, uniforms
+
+  // Start native capture
+  window.api.startCapture();
+  window.api.onFrame((frameBuffer, w, h) => {
+    // Upload frameBuffer to GPU texture
+    // Render a quad with current depth parameter
+  });
+
+  // UI binding
+  depthSlider.oninput = () => { /* update uniform buffer */ };
+  toggleBtn.onclick = () => { /* show/hide canvas */ };
+
+  window.api.onToggle(() => { /* toggle overlay visibility */ });
+})();
+```
+
+---
+
+### 6. Performance & Reliability Tips
+
+- **Zero-copy capture:** Desktop Duplication API yields DXGI `IDXGIResource` textures.  
+- **Batch uniforms updates:** Map/unmap uniform buffer only on depth change, not per frame.  
+- **Limit FPS:** Throttle to 30 FPS if 60+ is unnecessary.  
+- **Error fallback:** If WebGPU/DXGI unavailable, fallback to WebGL + `desktopCapturer`.
+- **AMD-specific tweaks:**  
+  - Query GPU vendorId, and if AMD, enable `VK_AMD_buffer_marker` to reduce sync overhead.  
+  - Use half-precision float textures (`R16G16B16A16_UNORM`) on RDNA2+ to halve memory bandwidth.  
+  - Integrate AMD GPU Services (AGS) library to detect GPU topology and optimize capture stride for multi-GPU setups.
+
+---
+
+### 7. Prebuilt Releases (No Build Required)
+
+To provide a turnkey experience, we’ll offer **prebuilt binaries** for Windows 10/11, so users can download and run without any manual build steps:
+
+1. **GitHub Releases**  
+   - Build and publish `.zip` and `.exe` installers under the repository’s [Releases](https://github.com/your-github-user/rc-3d-desktop/releases) page.  
+   - Example assets per release:  
+     - `RC-3D-Desktop-Setup-0.2.0-x64.exe`  
+     - `RC-3D-Desktop-0.2.0-portable-x64.zip`
+2. **Direct Download Links**  
+   - On your project homepage, embed download buttons pointing to the latest release assets.  
+   - E.g.:  
+     ```html
+     <a href="sandbox:/mnt/data/RC_3D_Desktop_Project.zip" class="btn">Download Installer</a>
+     <a href="sandbox:/mnt/data/RC_3D_Desktop_Project.zip" class="btn">Download Portable ZIP</a>
+     ```
+3. **One‑Click Run (Portable)**  
+   - Users unzip the portable ZIP, double‑click `RC-3D-Desktop.exe`, and the app launches with 3D overlay enabled by default.
+4. **Installer Experience**  
+   - Users run the NSIS installer, accept the license, choose install folder, and launch from desktop or Start Menu shortcuts—no npm or build tools required.
+
+With this setup, end users simply download the appropriate asset for their preference (installer or portable) and run—no development environment or manual builds required.
